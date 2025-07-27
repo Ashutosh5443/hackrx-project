@@ -43,7 +43,8 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     It checks if the provided token matches the one specified in the environment.
     Raises an HTTPException (403 Forbidden) if the token is invalid.
     """
-    if not HACKRX_TOKEN or credentials.token != HACKRX_TOKEN:
+    # CORRECTED LINE: The attribute is 'credentials', not 'token'.
+    if not HACKRX_TOKEN or credentials.credentials != HACKRX_TOKEN:
         logging.warning("Authentication failed: Invalid token provided.")
         raise HTTPException(
             status_code=403,
