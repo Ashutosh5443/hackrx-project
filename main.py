@@ -43,7 +43,6 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     It checks if the provided token matches the one specified in the environment.
     Raises an HTTPException (403 Forbidden) if the token is invalid.
     """
-    # CORRECTED LINE: The attribute is 'credentials', not 'token'.
     if not HACKRX_TOKEN or credentials.credentials != HACKRX_TOKEN:
         logging.warning("Authentication failed: Invalid token provided.")
         raise HTTPException(
@@ -254,18 +253,25 @@ async def hackrx_run(payload: HackRxRunRequest, _=Depends(get_current_user)):
 
     # 2. Setup Pinecone index and upload document chunks
     with get_pinecone_index() as index:
-        logging.info("Generating embeddings and upserting to Pinecone...")
+        # --- OPTIMIZED SECTION ---
+        logging.info("Generating embeddings for all chunks at once (this may take a moment)...")
+        # Encode all chunks in a single, efficient batch call
+        all_embeddings = embedding_model.encode(text_chunks, show_progress_bar=True)
+        logging.info("Embeddings generated. Preparing for upsert.")
+
         vectors_to_upsert = []
-        for i, chunk in enumerate(text_chunks):
-            embedding = embedding_model.encode(chunk).tolist()
+        for i, (chunk, embedding) in enumerate(zip(text_chunks, all_embeddings)):
             vectors_to_upsert.append({
                 "id": f"chunk_{i}",
-                "values": embedding,
+                "values": embedding.tolist(),
                 "metadata": {"text": chunk}
             })
+        
         # Upsert in batches for efficiency
+        logging.info(f"Upserting {len(vectors_to_upsert)} vectors to Pinecone...")
         index.upsert(vectors=vectors_to_upsert, batch_size=100)
         logging.info(f"Successfully upserted {len(vectors_to_upsert)} vectors to Pinecone.")
+        # --- END OF OPTIMIZED SECTION ---
 
         # 3. Process each question
         answers = []
