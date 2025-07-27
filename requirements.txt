@@ -7,7 +7,7 @@ uvicorn
 pydantic
 requests
 pypdf
-pinecone-client
+pinecone
 google-generativeai
 python-dotenv
 sentence-transformers
