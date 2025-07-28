@@ -15,7 +15,7 @@ from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- Document Processing & AI ---
-import pydpdf
+import pypdf # <-- CORRECTED TYPO HERE
 import google.generativeai as genai
 
 # --- Vector Database ---
