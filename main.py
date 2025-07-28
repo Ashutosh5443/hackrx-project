@@ -5,7 +5,7 @@ import requests
 import logging
 from contextlib import contextmanager
 import uuid
-import asyncio # <-- Import for parallel processing
+import asyncio
 
 # --- Web Framework ---
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -84,8 +84,8 @@ def download_and_read_pdf(url: str) -> str:
         logging.error(f"Failed to download or process PDF: {e}")
         raise HTTPException(status_code=500, detail=f"Could not process PDF from URL: {e}")
 
-def chunk_text(text: str, chunk_size: int = 512, chunk_overlap: int = 100) -> List[str]:
-    """Splits text into smaller, more focused chunks for better retrieval accuracy."""
+def chunk_text(text: str, chunk_size: int = 1024, chunk_overlap: int = 200) -> List[str]:
+    """Splits text into coherent, overlapping chunks."""
     if not text: return []
     chunks = []
     start = 0
@@ -119,7 +119,7 @@ def get_pinecone_index():
             pc.delete_index(index_name)
 
 async def process_single_question(question: str, index) -> str:
-    """Asynchronous function to process one question: get context and generate answer."""
+    """Asynchronous function to process one question with advanced reasoning."""
     # 1. Get relevant context from Pinecone
     response = await asyncio.to_thread(
         genai.embed_content,
@@ -132,25 +132,24 @@ async def process_single_question(question: str, index) -> str:
     query_result = await asyncio.to_thread(
         index.query,
         vector=question_embedding,
-        top_k=10, 
+        top_k=12, 
         include_metadata=True
     )
     context_chunks = [match['metadata']['text'] for match in query_result['matches']]
     context = "\n---\n".join(context_chunks)
     logging.info(f"Retrieved context for question: '{question[:50]}...'")
 
-    # 2. Generate answer with LLM using the new, more direct prompt
+    # 2. Generate answer with the advanced Chain-of-Thought LLM prompt
     if not context:
         return "The answer to this question is not available in the provided document excerpts."
 
     prompt = f"""
-    You are an expert information retriever. Your task is to find and provide a direct answer to the user's question using ONLY the provided text snippets from a document.
+    You are an AI expert at analyzing documents. Your task is to answer the user's question based *only* on the provided context. Follow these steps meticulously:
 
-    **Instructions:**
-    - Find the most direct answer to the **User's Question** within the **Context Snippets**.
-    - Formulate a concise and clear answer based on the information you find.
-    - Do not add any information not present in the snippets.
-    - If the answer is not in the provided text, state: "The answer to this question is not available in the provided document excerpts."
+    1.  **Analyze the Question:** What is the core information the user is asking for?
+    2.  **Find Evidence:** Scan the 'Context Snippets' and extract the *exact* sentences or phrases that are relevant to the question.
+    3.  **Synthesize:** Combine the evidence to form a logical conclusion.
+    4.  **Final Answer:** Based on your synthesis, provide a concise and direct answer to the user's question. If you cannot find the answer in the snippets, and only then, state: 'The answer could not be found in the provided text.'
 
     **Context Snippets:**
     {context}
@@ -158,18 +157,32 @@ async def process_single_question(question: str, index) -> str:
     **User's Question:**
     {question}
 
-    **Direct Answer:**
+    **Chain of Thought:**
+    1.  **Analysis:** [Analyze the user's question here]
+    2.  **Evidence:** [Extract the supporting sentences from the context here]
+    3.  **Synthesis:** [Combine the evidence into a conclusion here]
+    4.  **Final Answer:** [Provide the final, direct answer here]
     """
     try:
         response = await llm_model.generate_content_async(prompt)
+        full_text = response.text
+        
+        # Extract only the "Final Answer" part for a clean response
+        if "Final Answer:" in full_text:
+            answer = full_text.split("Final Answer:")[-1].strip()
+        elif "Final Answer" in full_text:
+             answer = full_text.split("Final Answer")[-1].strip()
+        else:
+            answer = full_text.strip() # Fallback
+
         logging.info(f"Generated answer for question: '{question[:50]}...'")
-        return response.text.strip()
+        return answer
     except Exception as e:
         logging.error(f"Error generating answer for '{question[:50]}...': {e}")
         return "An error occurred while generating the answer."
 
 # --- FastAPI Application ---
-app = FastAPI(title="HackRx 6.0 Q&A System (High-Performance)")
+app = FastAPI(title="HackRx 6.0 Q&A System (Advanced Reasoning)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -215,11 +228,9 @@ async def hackrx_run(payload: HackRxRunRequest, _=Depends(get_current_user)):
         index.upsert(vectors=vectors_to_upsert, batch_size=100)
         logging.info("Successfully upserted vectors.")
 
-        # --- SPEED OPTIMIZATION: Process all questions in parallel ---
         logging.info("Processing all questions concurrently...")
         tasks = [process_single_question(q, index) for q in payload.questions]
         answers = await asyncio.gather(*tasks)
-        # --- END OF SPEED OPTIMIZATION ---
 
     logging.info("Successfully processed all questions. Returning response.")
     return HackRxRunResponse(answers=answers)
