@@ -2,7 +2,7 @@ fastapi
 uvicorn
 pydantic
 requests
-pypdf
+PyMuPDF
 google-generativeai
 python-dotenv
 numpy
