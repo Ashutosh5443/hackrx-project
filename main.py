@@ -16,7 +16,6 @@ from fastapi.middleware.cors import CORSMiddleware
 # --- Document Processing & AI ---
 import pypdf
 import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
 import numpy as np
 
 # --- Logging Configuration ---
@@ -47,7 +46,6 @@ class HackRxRunResponse(BaseModel):
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     llm_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
     logging.info("Models and services initialized successfully.")
 except Exception as e:
     logging.error(f"Initialization failed: {e}")
@@ -69,7 +67,9 @@ def download_and_read_pdf(url: str) -> str:
         with open("temp_document.pdf", 'rb') as file:
             pdf_reader = pypdf.PdfReader(file)
             for page in pdf_reader.pages:
-                text += page.extract_text() or ""
+                page_text = page.extract_text() or ""
+                # Clean up the text by removing excessive newlines and spaces
+                text += re.sub(r'\s+', ' ', page_text).strip() + "\n"
         
         os.remove("temp_document.pdf")
         return text
@@ -79,8 +79,7 @@ def download_and_read_pdf(url: str) -> str:
 
 def get_text_chunks(text: str) -> List[str]:
     """Splits text into paragraphs or large chunks."""
-    # Split by double newlines, then filter out empty strings and very short lines
-    chunks = [chunk.strip() for chunk in text.split('\n\n') if len(chunk.strip()) > 10]
+    chunks = [chunk.strip() for chunk in text.split('\n\n') if len(chunk.strip()) > 50]
     logging.info(f"Split text into {len(chunks)} chunks.")
     return chunks
 
@@ -88,37 +87,27 @@ def cosine_similarity(v1, v2):
     """Calculates cosine similarity between two vectors."""
     return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
 
-async def process_single_question(question: str, all_chunks: List[str], chunk_embeddings: np.ndarray) -> str:
+async def process_single_question(question: str, all_chunks: List[str], chunk_embeddings: List[List[float]]) -> str:
     """Processes a single question using a robust keyword + semantic search approach."""
     logging.info(f"Processing question: '{question[:50]}...'")
 
-    # --- Step 1: Keyword Filtering ---
-    keywords = [word for word in re.split(r'\W+', question) if len(word) > 3 and word.lower() not in ['what', 'is', 'the', 'does', 'for', 'are', 'this', 'how']]
+    # --- Step 1: Semantic Search in Memory ---
+    question_embedding_response = await asyncio.to_thread(
+        genai.embed_content,
+        model='models/text-embedding-004',
+        content=question,
+        task_type="RETRIEVAL_QUERY"
+    )
+    question_embedding = question_embedding_response['embedding']
+
+    similarities = [cosine_similarity(question_embedding, emb) for emb in chunk_embeddings]
     
-    candidate_chunks = []
-    if keywords:
-        for chunk in all_chunks:
-            if any(re.search(r'\b' + re.escape(keyword) + r'\b', chunk, re.IGNORECASE) for keyword in keywords):
-                candidate_chunks.append(chunk)
-
-    if not candidate_chunks:
-        logging.warning("No candidate chunks found after keyword filtering. Using all chunks as fallback.")
-        candidate_chunks = all_chunks
-
-    logging.info(f"Found {len(candidate_chunks)} candidate chunks after keyword filtering.")
-
-    # --- Step 2: Semantic Ranking ---
-    question_embedding = embedding_model.encode(question)
-    candidate_indices = [all_chunks.index(c) for c in candidate_chunks]
-    candidate_embeddings = chunk_embeddings[candidate_indices]
-
-    similarities = [cosine_similarity(question_embedding, emb) for emb in candidate_embeddings]
-    
-    top_k_indices = np.argsort(similarities)[-8:][::-1] # Get top 8 for broader context
-    top_chunks = [candidate_chunks[i] for i in top_k_indices]
+    # Get the top 8 most relevant chunks for context
+    top_k_indices = np.argsort(similarities)[-8:][::-1]
+    top_chunks = [all_chunks[i] for i in top_k_indices]
     context = "\n---\n".join(top_chunks)
 
-    # --- Step 3: Answer Generation with a Decisive Prompt ---
+    # --- Step 2: Answer Generation with a Decisive Prompt ---
     prompt = f"""
     You are an AI expert at analyzing policy documents. Your task is to provide a direct, accurate answer to the user's question using ONLY the provided context.
 
@@ -166,19 +155,22 @@ async def hackrx_run(payload: HackRxRunRequest, _=Depends(get_current_user)):
     """Main endpoint to process a document and questions."""
     logging.info("Received request for /hackrx/run")
     
-    # 1. Download and chunk the document text
     document_text = download_and_read_pdf(payload.documents)
     text_chunks = get_text_chunks(document_text)
     
     if not text_chunks:
         raise HTTPException(status_code=500, detail="Failed to extract any text from the document.")
 
-    # 2. Pre-compute embeddings for all chunks (done once per request)
-    logging.info("Pre-computing embeddings for all document chunks...")
-    chunk_embeddings = embedding_model.encode(text_chunks)
+    logging.info("Pre-computing embeddings for all document chunks via Gemini API...")
+    embedding_response = await asyncio.to_thread(
+        genai.embed_content,
+        model='models/text-embedding-004',
+        content=text_chunks,
+        task_type="RETRIEVAL_DOCUMENT"
+    )
+    chunk_embeddings = embedding_response['embedding']
     logging.info("Embeddings computed.")
 
-    # 3. Process all questions in parallel for maximum speed
     logging.info("Processing all questions concurrently...")
     tasks = [process_single_question(q, text_chunks, chunk_embeddings) for q in payload.questions]
     answers = await asyncio.gather(*tasks)
