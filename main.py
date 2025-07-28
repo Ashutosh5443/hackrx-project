@@ -83,8 +83,8 @@ def download_and_read_pdf(url: str) -> str:
         logging.error(f"Failed to download or process PDF: {e}")
         raise HTTPException(status_code=500, detail=f"Could not process PDF from URL: {e}")
 
-def chunk_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 150) -> List[str]:
-    """Splits text into smaller, more focused chunks."""
+def chunk_text(text: str, chunk_size: int = 512, chunk_overlap: int = 100) -> List[str]:
+    """Splits text into smaller, more focused chunks for better retrieval accuracy."""
     if not text: return []
     chunks = []
     start = 0
@@ -127,10 +127,10 @@ def get_relevant_context(question: str, index) -> str:
         )
         question_embedding = response['embedding']
         
-        # Retrieve more chunks to give the LLM better context
+        # Retrieve more chunks (wider search) to give the LLM better context
         query_result = index.query(
             vector=question_embedding,
-            top_k=8, 
+            top_k=12, 
             include_metadata=True
         )
         context_chunks = [match['metadata']['text'] for match in query_result['matches']]
@@ -144,18 +144,17 @@ def get_relevant_context(question: str, index) -> str:
 def answer_question_with_llm(question: str, context: str) -> str:
     """Uses the LLM to generate an answer based on the provided context with improved instructions."""
     if not context:
-        return "The provided document does not contain a clear answer to this question."
+        return "The answer to this question is not available in the provided document excerpts."
 
-    # New, more robust prompt
+    # New, more direct and confident prompt
     prompt = f"""
-    You are an expert AI assistant for analyzing policy documents. Your task is to provide a clear and accurate answer to the user's question based on the provided text snippets from a document.
+    You are a highly skilled information extraction AI. Your sole purpose is to answer the user's question using ONLY the provided text snippets from a policy document.
 
     **Instructions:**
-    1. Carefully read the user's question.
-    2. Thoroughly review all the provided context snippets.
-    3. Synthesize the information from the snippets to formulate a direct answer to the question.
-    4. If the snippets contain the answer, provide it clearly and concisely.
-    5. If the snippets do not contain enough information to answer the question directly, and only in that case, respond with "The provided document does not contain a clear answer to this question."
+    1. Find the most direct answer to the **User's Question** within the **Context Snippets**.
+    2. Quote the relevant text directly if possible, or summarize the key points that form a complete answer.
+    3. Do not add any information that is not present in the snippets.
+    4. If, after a thorough review, you are absolutely certain the answer is not in the provided snippets, and only then, respond with: 'The answer to this question is not available in the provided document excerpts.'
 
     **Context Snippets:**
     {context}
@@ -163,7 +162,7 @@ def answer_question_with_llm(question: str, context: str) -> str:
     **User's Question:**
     {question}
 
-    **Answer:**
+    **Direct Answer:**
     """
     try:
         response = llm_model.generate_content(prompt)
@@ -174,7 +173,7 @@ def answer_question_with_llm(question: str, context: str) -> str:
         return "There was an error generating the answer."
 
 # --- FastAPI Application ---
-app = FastAPI(title="HackRx 6.0 Q&A System (Accuracy Fix)")
+app = FastAPI(title="HackRx 6.0 Q&A System (Intelligence Upgrade)")
 
 app.add_middleware(
     CORSMiddleware,
