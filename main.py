@@ -51,7 +51,6 @@ try:
     pc = Pinecone(api_key=PINECONE_API_KEY)
     genai.configure(api_key=GEMINI_API_KEY)
     llm_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-    # The dimension for the Gemini embedding model
     EMBEDDING_DIMENSION = 768
     logging.info("Models and services initialized successfully.")
 except Exception as e:
@@ -84,8 +83,8 @@ def download_and_read_pdf(url: str) -> str:
         logging.error(f"Failed to download or process PDF: {e}")
         raise HTTPException(status_code=500, detail=f"Could not process PDF from URL: {e}")
 
-def chunk_text(text: str, chunk_size: int = 2000, chunk_overlap: int = 300) -> List[str]:
-    """Splits text into overlapping chunks."""
+def chunk_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 150) -> List[str]:
+    """Splits text into smaller, more focused chunks."""
     if not text: return []
     chunks = []
     start = 0
@@ -107,7 +106,7 @@ def get_pinecone_index():
         logging.info(f"Creating new Pinecone index: {index_name}")
         pc.create_index(
             name=index_name,
-            dimension=EMBEDDING_DIMENSION, # Using the new dimension for Gemini
+            dimension=EMBEDDING_DIMENSION,
             metric="cosine",
             spec=ServerlessSpec(cloud="aws", region=PINECONE_ENVIRONMENT)
         )
@@ -121,7 +120,6 @@ def get_pinecone_index():
 def get_relevant_context(question: str, index) -> str:
     """Searches Pinecone for context relevant to a single question using Gemini embeddings."""
     try:
-        # Generate embedding for the question using Gemini API
         response = genai.embed_content(
             model='models/text-embedding-004',
             content=question,
@@ -129,9 +127,10 @@ def get_relevant_context(question: str, index) -> str:
         )
         question_embedding = response['embedding']
         
+        # Retrieve more chunks to give the LLM better context
         query_result = index.query(
             vector=question_embedding,
-            top_k=5,
+            top_k=8, 
             include_metadata=True
         )
         context_chunks = [match['metadata']['text'] for match in query_result['matches']]
@@ -143,21 +142,28 @@ def get_relevant_context(question: str, index) -> str:
         return ""
 
 def answer_question_with_llm(question: str, context: str) -> str:
-    """Uses the LLM to generate an answer based on the provided context."""
+    """Uses the LLM to generate an answer based on the provided context with improved instructions."""
     if not context:
-        return "Could not find relevant information in the document to answer this question."
+        return "The provided document does not contain a clear answer to this question."
 
+    # New, more robust prompt
     prompt = f"""
-    You are an expert Q&A system. Your task is to answer the user's question based *only* on the provided context from a document.
-    Be concise and directly answer the question. If the context does not contain the answer, state that the information is not available in the provided text.
+    You are an expert AI assistant for analyzing policy documents. Your task is to provide a clear and accurate answer to the user's question based on the provided text snippets from a document.
 
-    CONTEXT:
+    **Instructions:**
+    1. Carefully read the user's question.
+    2. Thoroughly review all the provided context snippets.
+    3. Synthesize the information from the snippets to formulate a direct answer to the question.
+    4. If the snippets contain the answer, provide it clearly and concisely.
+    5. If the snippets do not contain enough information to answer the question directly, and only in that case, respond with "The provided document does not contain a clear answer to this question."
+
+    **Context Snippets:**
     {context}
 
-    QUESTION:
+    **User's Question:**
     {question}
 
-    ANSWER:
+    **Answer:**
     """
     try:
         response = llm_model.generate_content(prompt)
@@ -168,7 +174,7 @@ def answer_question_with_llm(question: str, context: str) -> str:
         return "There was an error generating the answer."
 
 # --- FastAPI Application ---
-app = FastAPI(title="HackRx 6.0 Q&A System (High-Speed)")
+app = FastAPI(title="HackRx 6.0 Q&A System (Accuracy Fix)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -197,7 +203,6 @@ async def hackrx_run(payload: HackRxRunRequest, _=Depends(get_current_user)):
 
     with get_pinecone_index() as index:
         logging.info("Generating embeddings for all chunks via Gemini API...")
-        # Generate embeddings for all document chunks in a single, fast API call
         response = genai.embed_content(
             model='models/text-embedding-004',
             content=text_chunks,
