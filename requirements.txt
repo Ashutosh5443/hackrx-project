@@ -1,7 +1,3 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
-torchaudio
 fastapi
 uvicorn
 pydantic
@@ -9,5 +5,4 @@ requests
 pypdf
 google-generativeai
 python-dotenv
-sentence-transformers
-numpy
+pinecone
