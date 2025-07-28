@@ -14,7 +14,7 @@ from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- Document Processing & AI ---
-import pypdf
+import fitz  # PyMuPDF
 import google.generativeai as genai
 import numpy as np
 
@@ -53,25 +53,21 @@ except Exception as e:
 
 # --- Helper Functions ---
 def download_and_read_pdf(url: str) -> str:
-    """Downloads and extracts text from a PDF URL."""
+    """Downloads and extracts clean text from a PDF URL using PyMuPDF."""
     try:
         logging.info(f"Downloading PDF from: {url}")
         response = requests.get(url, timeout=20)
         response.raise_for_status()
         
-        with open("temp_document.pdf", "wb") as f:
-            f.write(response.content)
-        
-        logging.info("PDF downloaded. Extracting text.")
+        pdf_bytes = response.content
         text = ""
-        with open("temp_document.pdf", 'rb') as file:
-            pdf_reader = pypdf.PdfReader(file)
-            for page in pdf_reader.pages:
-                page_text = page.extract_text() or ""
-                # Clean up the text by removing excessive newlines and spaces
-                text += re.sub(r'\s+', ' ', page_text).strip() + "\n"
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            for page in doc:
+                text += page.get_text() + "\n"
         
-        os.remove("temp_document.pdf")
+        # Clean up the extracted text
+        text = re.sub(r'\s+', ' ', text).strip()
+        logging.info(f"Extracted {len(text)} characters from the PDF.")
         return text
     except Exception as e:
         logging.error(f"Failed to download or process PDF: {e}")
@@ -80,6 +76,8 @@ def download_and_read_pdf(url: str) -> str:
 def get_text_chunks(text: str) -> List[str]:
     """Splits text into paragraphs or large chunks."""
     chunks = [chunk.strip() for chunk in text.split('\n\n') if len(chunk.strip()) > 50]
+    if not chunks: # Fallback for documents without double newlines
+        chunks = [text[i:i+1000] for i in range(0, len(text), 800)]
     logging.info(f"Split text into {len(chunks)} chunks.")
     return chunks
 
@@ -88,7 +86,7 @@ def cosine_similarity(v1, v2):
     return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
 
 async def process_single_question(question: str, all_chunks: List[str], chunk_embeddings: List[List[float]]) -> str:
-    """Processes a single question using a robust keyword + semantic search approach."""
+    """Processes a single question using in-memory semantic search."""
     logging.info(f"Processing question: '{question[:50]}...'")
 
     # --- Step 1: Semantic Search in Memory ---
@@ -136,7 +134,7 @@ async def process_single_question(question: str, all_chunks: List[str], chunk_em
         return "An error occurred while generating the answer."
 
 # --- FastAPI Application ---
-app = FastAPI(title="HackRx 6.0 Q&A System (Definitive Fix)")
+app = FastAPI(title="HackRx 6.0 Q&A System (High-Accuracy Engine)")
 
 app.add_middleware(
     CORSMiddleware,
