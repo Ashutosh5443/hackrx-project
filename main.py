@@ -5,6 +5,7 @@ import requests
 import logging
 from contextlib import contextmanager
 import uuid
+import asyncio # <-- Import for parallel processing
 
 # --- Web Framework ---
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -117,44 +118,39 @@ def get_pinecone_index():
             logging.info(f"Deleting Pinecone index '{index_name}' after processing.")
             pc.delete_index(index_name)
 
-def get_relevant_context(question: str, index) -> str:
-    """Searches Pinecone for context relevant to a single question using Gemini embeddings."""
-    try:
-        response = genai.embed_content(
-            model='models/text-embedding-004',
-            content=question,
-            task_type="RETRIEVAL_QUERY"
-        )
-        question_embedding = response['embedding']
-        
-        # Retrieve more chunks (wider search) to give the LLM better context
-        query_result = index.query(
-            vector=question_embedding,
-            top_k=12, 
-            include_metadata=True
-        )
-        context_chunks = [match['metadata']['text'] for match in query_result['matches']]
-        context = "\n---\n".join(context_chunks)
-        logging.info(f"Retrieved context for question: '{question[:50]}...'")
-        return context
-    except Exception as e:
-        logging.error(f"Error retrieving context from Pinecone: {e}")
-        return ""
+async def process_single_question(question: str, index) -> str:
+    """Asynchronous function to process one question: get context and generate answer."""
+    # 1. Get relevant context from Pinecone
+    response = await asyncio.to_thread(
+        genai.embed_content,
+        model='models/text-embedding-004',
+        content=question,
+        task_type="RETRIEVAL_QUERY"
+    )
+    question_embedding = response['embedding']
+    
+    query_result = await asyncio.to_thread(
+        index.query,
+        vector=question_embedding,
+        top_k=10, 
+        include_metadata=True
+    )
+    context_chunks = [match['metadata']['text'] for match in query_result['matches']]
+    context = "\n---\n".join(context_chunks)
+    logging.info(f"Retrieved context for question: '{question[:50]}...'")
 
-def answer_question_with_llm(question: str, context: str) -> str:
-    """Uses the LLM to generate an answer based on the provided context with improved instructions."""
+    # 2. Generate answer with LLM using the new, more direct prompt
     if not context:
         return "The answer to this question is not available in the provided document excerpts."
 
-    # New, more direct and confident prompt
     prompt = f"""
-    You are a highly skilled information extraction AI. Your sole purpose is to answer the user's question using ONLY the provided text snippets from a policy document.
+    You are an expert information retriever. Your task is to find and provide a direct answer to the user's question using ONLY the provided text snippets from a document.
 
     **Instructions:**
-    1. Find the most direct answer to the **User's Question** within the **Context Snippets**.
-    2. Quote the relevant text directly if possible, or summarize the key points that form a complete answer.
-    3. Do not add any information that is not present in the snippets.
-    4. If, after a thorough review, you are absolutely certain the answer is not in the provided snippets, and only then, respond with: 'The answer to this question is not available in the provided document excerpts.'
+    - Find the most direct answer to the **User's Question** within the **Context Snippets**.
+    - Formulate a concise and clear answer based on the information you find.
+    - Do not add any information not present in the snippets.
+    - If the answer is not in the provided text, state: "The answer to this question is not available in the provided document excerpts."
 
     **Context Snippets:**
     {context}
@@ -165,15 +161,15 @@ def answer_question_with_llm(question: str, context: str) -> str:
     **Direct Answer:**
     """
     try:
-        response = llm_model.generate_content(prompt)
+        response = await llm_model.generate_content_async(prompt)
         logging.info(f"Generated answer for question: '{question[:50]}...'")
         return response.text.strip()
     except Exception as e:
-        logging.error(f"Error generating answer with LLM: {e}")
-        return "There was an error generating the answer."
+        logging.error(f"Error generating answer for '{question[:50]}...': {e}")
+        return "An error occurred while generating the answer."
 
 # --- FastAPI Application ---
-app = FastAPI(title="HackRx 6.0 Q&A System (Intelligence Upgrade)")
+app = FastAPI(title="HackRx 6.0 Q&A System (High-Performance)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -219,11 +215,11 @@ async def hackrx_run(payload: HackRxRunRequest, _=Depends(get_current_user)):
         index.upsert(vectors=vectors_to_upsert, batch_size=100)
         logging.info("Successfully upserted vectors.")
 
-        answers = []
-        for question in payload.questions:
-            context = get_relevant_context(question, index)
-            answer = answer_question_with_llm(question, context)
-            answers.append(answer)
+        # --- SPEED OPTIMIZATION: Process all questions in parallel ---
+        logging.info("Processing all questions concurrently...")
+        tasks = [process_single_question(q, index) for q in payload.questions]
+        answers = await asyncio.gather(*tasks)
+        # --- END OF SPEED OPTIMIZATION ---
 
     logging.info("Successfully processed all questions. Returning response.")
     return HackRxRunResponse(answers=answers)
