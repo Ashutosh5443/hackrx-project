@@ -3,6 +3,7 @@ uvicorn
 pydantic
 requests
 pypdf
-pinecone
 google-generativeai
 python-dotenv
+sentence-transformers
+numpy
