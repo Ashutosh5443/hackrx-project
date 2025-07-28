@@ -84,7 +84,7 @@ def download_and_read_pdf(url: str) -> str:
         logging.error(f"Failed to download or process PDF: {e}")
         raise HTTPException(status_code=500, detail=f"Could not process PDF from URL: {e}")
 
-def chunk_text(text: str, chunk_size: int = 1024, chunk_overlap: int = 200) -> List[str]:
+def chunk_text(text: str, chunk_size: int = 800, chunk_overlap: int = 150) -> List[str]:
     """Splits text into coherent, overlapping chunks."""
     if not text: return []
     chunks = []
@@ -119,7 +119,7 @@ def get_pinecone_index():
             pc.delete_index(index_name)
 
 async def process_single_question(question: str, index) -> str:
-    """Asynchronous function to process one question with advanced reasoning."""
+    """Asynchronous function to process one question with a simplified, direct prompt."""
     # 1. Get relevant context from Pinecone
     response = await asyncio.to_thread(
         genai.embed_content,
@@ -139,17 +139,18 @@ async def process_single_question(question: str, index) -> str:
     context = "\n---\n".join(context_chunks)
     logging.info(f"Retrieved context for question: '{question[:50]}...'")
 
-    # 2. Generate answer with the advanced Chain-of-Thought LLM prompt
+    # 2. Generate answer with a new, more direct and assertive prompt
     if not context:
         return "The answer to this question is not available in the provided document excerpts."
 
     prompt = f"""
-    You are an AI expert at analyzing documents. Your task is to answer the user's question based *only* on the provided context. Follow these steps meticulously:
+    You are an AI Information Extractor. Your task is to provide a direct and concise answer to the user's question using ONLY the provided text from a document.
 
-    1.  **Analyze the Question:** What is the core information the user is asking for?
-    2.  **Find Evidence:** Scan the 'Context Snippets' and extract the *exact* sentences or phrases that are relevant to the question.
-    3.  **Synthesize:** Combine the evidence to form a logical conclusion.
-    4.  **Final Answer:** Based on your synthesis, provide a concise and direct answer to the user's question. If you cannot find the answer in the snippets, and only then, state: 'The answer could not be found in the provided text.'
+    **Instructions:**
+    - Your primary goal is to find the answer. Assume the answer is present in the context.
+    - Extract the key information from the **Context Snippets** that directly answers the **User's Question**.
+    - Formulate a clear and direct answer.
+    - Do not add any information not present in the snippets. Do not apologize or explain. Just provide the answer.
 
     **Context Snippets:**
     {context}
@@ -157,24 +158,11 @@ async def process_single_question(question: str, index) -> str:
     **User's Question:**
     {question}
 
-    **Chain of Thought:**
-    1.  **Analysis:** [Analyze the user's question here]
-    2.  **Evidence:** [Extract the supporting sentences from the context here]
-    3.  **Synthesis:** [Combine the evidence into a conclusion here]
-    4.  **Final Answer:** [Provide the final, direct answer here]
+    **Answer:**
     """
     try:
         response = await llm_model.generate_content_async(prompt)
-        full_text = response.text
-        
-        # Extract only the "Final Answer" part for a clean response
-        if "Final Answer:" in full_text:
-            answer = full_text.split("Final Answer:")[-1].strip()
-        elif "Final Answer" in full_text:
-             answer = full_text.split("Final Answer")[-1].strip()
-        else:
-            answer = full_text.strip() # Fallback
-
+        answer = response.text.strip()
         logging.info(f"Generated answer for question: '{question[:50]}...'")
         return answer
     except Exception as e:
@@ -182,7 +170,7 @@ async def process_single_question(question: str, index) -> str:
         return "An error occurred while generating the answer."
 
 # --- FastAPI Application ---
-app = FastAPI(title="HackRx 6.0 Q&A System (Advanced Reasoning)")
+app = FastAPI(title="HackRx 6.0 Q&A System (Direct Extraction Engine)")
 
 app.add_middleware(
     CORSMiddleware,
