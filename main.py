@@ -3,11 +3,12 @@
 import os
 import requests
 import logging
+from contextlib import contextmanager
+import uuid
 import asyncio
-import re
 
 # --- Web Framework ---
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import List
@@ -16,13 +17,16 @@ from fastapi.middleware.cors import CORSMiddleware
 # --- Document Processing & AI ---
 import pypdf
 import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
-import numpy as np
+
+# --- Vector Database ---
+from pinecone import Pinecone, ServerlessSpec
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Environment Variable Loading ---
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+PINECONE_ENVIRONMENT = os.environ.get("PINECONE_ENVIRONMENT", "us-east-1")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 HACKRX_TOKEN = os.environ.get("HACKRX_TOKEN")
 
@@ -35,7 +39,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=403, detail="Invalid authentication credentials")
     return credentials
 
-# --- Pydantic Models ---
+# --- Pydantic Models (Matching the Hackathon Spec) ---
 class HackRxRunRequest(BaseModel):
     documents: str = Field(..., description="URL to the PDF document to be processed.")
     questions: List[str] = Field(..., description="A list of questions to be answered based on the document.")
@@ -45,9 +49,10 @@ class HackRxRunResponse(BaseModel):
 
 # --- Global Initializations ---
 try:
+    pc = Pinecone(api_key=PINECONE_API_KEY)
     genai.configure(api_key=GEMINI_API_KEY)
     llm_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    EMBEDDING_DIMENSION = 768
     logging.info("Models and services initialized successfully.")
 except Exception as e:
     logging.error(f"Initialization failed: {e}")
@@ -77,59 +82,72 @@ def download_and_read_pdf(url: str) -> str:
         logging.error(f"Failed to download or process PDF: {e}")
         raise HTTPException(status_code=500, detail=f"Could not process PDF from URL: {e}")
 
-def get_text_chunks(text: str) -> List[str]:
-    """Splits text into paragraphs or large chunks."""
-    # Split by double newlines, then filter out empty strings
-    chunks = [chunk.strip() for chunk in text.split('\n\n') if chunk.strip()]
+def chunk_text(text: str, chunk_size: int = 1024, chunk_overlap: int = 200) -> List[str]:
+    """Splits text into coherent, overlapping chunks."""
+    if not text: return []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - chunk_overlap
     logging.info(f"Split text into {len(chunks)} chunks.")
     return chunks
 
-def cosine_similarity(v1, v2):
-    """Calculates cosine similarity between two vectors."""
-    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+@contextmanager
+def get_pinecone_index():
+    """Context manager to create, use, and delete a temporary Pinecone index for each request."""
+    index_name = f"hackrx-session-{uuid.uuid4().hex[:8]}"
+    try:
+        if index_name in pc.list_indexes().names():
+            pc.delete_index(index_name)
+        
+        logging.info(f"Creating new Pinecone index: {index_name}")
+        pc.create_index(
+            name=index_name,
+            dimension=EMBEDDING_DIMENSION,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region=PINECONE_ENVIRONMENT)
+        )
+        index = pc.Index(index_name)
+        yield index
+    finally:
+        if index_name in pc.list_indexes().names():
+            logging.info(f"Deleting Pinecone index '{index_name}' after processing.")
+            pc.delete_index(index_name)
 
-async def process_single_question(question: str, all_chunks: List[str], chunk_embeddings: np.ndarray) -> str:
-    """Processes a single question using a robust keyword + semantic search approach."""
-    logging.info(f"Processing question: '{question[:50]}...'")
-
-    # --- Step 1: Keyword Filtering ---
-    # Extract keywords from the question to narrow down the search space.
-    keywords = [word for word in re.split(r'\W+', question) if len(word) > 3 and word.lower() not in ['what', 'is', 'the', 'does', 'for', 'are']]
+async def process_single_question(question: str, index) -> str:
+    """Asynchronous function to process one question with the new reasoning engine."""
+    # 1. Get relevant context from Pinecone
+    response = await asyncio.to_thread(
+        genai.embed_content,
+        model='models/text-embedding-004',
+        content=question,
+        task_type="RETRIEVAL_QUERY"
+    )
+    question_embedding = response['embedding']
     
-    candidate_chunks = []
-    for chunk in all_chunks:
-        if any(re.search(r'\b' + re.escape(keyword) + r'\b', chunk, re.IGNORECASE) for keyword in keywords):
-            candidate_chunks.append(chunk)
+    query_result = await asyncio.to_thread(
+        index.query,
+        vector=question_embedding,
+        top_k=15,
+        include_metadata=True
+    )
+    context_chunks = [match['metadata']['text'] for match in query_result['matches']]
+    context = "\n---\n".join(context_chunks)
+    logging.info(f"Retrieved context for question: '{question[:50]}...'")
 
-    if not candidate_chunks:
-        logging.warning("No candidate chunks found after keyword filtering.")
-        candidate_chunks = all_chunks # Fallback to all chunks if no keywords match
+    # 2. Generate answer with the advanced "Chain-of-Thought" reasoning prompt
+    if not context:
+        return "The answer to this question is not available in the provided document excerpts."
 
-    logging.info(f"Found {len(candidate_chunks)} candidate chunks after keyword filtering.")
-
-    # --- Step 2: Semantic Ranking ---
-    # Embed the question and find the most similar chunks from the candidates.
-    question_embedding = embedding_model.encode(question)
-    candidate_indices = [all_chunks.index(c) for c in candidate_chunks]
-    candidate_embeddings = chunk_embeddings[candidate_indices]
-
-    similarities = [cosine_similarity(question_embedding, emb) for emb in candidate_embeddings]
-    
-    # Get the top 5 most similar chunks
-    top_k_indices = np.argsort(similarities)[-5:][::-1]
-    top_chunks = [candidate_chunks[i] for i in top_k_indices]
-    context = "\n---\n".join(top_chunks)
-
-    # --- Step 3: Answer Generation with a Decisive Prompt ---
     prompt = f"""
-    You are an AI expert at analyzing policy documents. Your task is to provide a direct, accurate answer to the user's question using ONLY the provided context.
+    You are an AI expert at analyzing policy documents. Your task is to answer the user's question with high accuracy, using only the provided context. Follow these steps meticulously:
 
-    **Instructions:**
-    1.  Your primary goal is to find and state the answer.
-    2.  Analyze the 'User's Question' and locate the most relevant information within the 'Context Snippets'.
-    3.  Construct a concise answer based *only* on the information you find.
-    4.  If the answer is explicitly present, quote it. If it's implied, summarize it.
-    5.  DO NOT apologize or state that the answer is not available unless it is absolutely impossible to derive an answer from the text. Be decisive.
+    1.  **Evidence Extraction:** First, carefully review all the 'Context Snippets' and identify the single most relevant sentence or phrase that directly answers the 'User's Question'. Extract this as 'Evidence'.
+    2.  **Final Answer Construction:** Second, use the 'Evidence' you just extracted to formulate a concise, direct answer to the 'User's Question'.
+
+    If you cannot find any relevant evidence after a thorough search of the snippets, and only in that case, your final answer should be: "The answer could not be found in the provided text."
 
     **Context Snippets:**
     {context}
@@ -137,11 +155,23 @@ async def process_single_question(question: str, all_chunks: List[str], chunk_em
     **User's Question:**
     {question}
 
-    **Answer:**
+    **Evidence:**
+    [Extract the single most relevant sentence from the context here.]
+
+    **Final Answer:**
+    [Construct the final, direct answer based on the evidence here.]
     """
     try:
         response = await llm_model.generate_content_async(prompt)
-        answer = response.text.strip()
+        full_text = response.text
+        
+        if "Final Answer:" in full_text:
+            answer = full_text.split("Final Answer:")[-1].strip()
+        elif "Final Answer" in full_text:
+             answer = full_text.split("Final Answer")[-1].strip()
+        else:
+            answer = full_text.strip()
+
         logging.info(f"Generated answer for question: '{question[:50]}...'")
         return answer
     except Exception as e:
@@ -165,25 +195,37 @@ def read_root():
 
 @app.post("/hackrx/run", response_model=HackRxRunResponse)
 async def hackrx_run(payload: HackRxRunRequest, _=Depends(get_current_user)):
-    """Main endpoint to process a document and questions."""
+    """Main endpoint that processes a document URL and a list of questions."""
     logging.info("Received request for /hackrx/run")
     
-    # 1. Download and chunk the document text
     document_text = download_and_read_pdf(payload.documents)
-    text_chunks = get_text_chunks(document_text)
+    text_chunks = chunk_text(document_text)
     
     if not text_chunks:
         raise HTTPException(status_code=500, detail="Failed to extract any text from the document.")
 
-    # 2. Pre-compute embeddings for all chunks (done once per request)
-    logging.info("Pre-computing embeddings for all document chunks...")
-    chunk_embeddings = embedding_model.encode(text_chunks)
-    logging.info("Embeddings computed.")
+    with get_pinecone_index() as index:
+        logging.info("Generating embeddings for all chunks via Gemini API...")
+        response = genai.embed_content(
+            model='models/text-embedding-004',
+            content=text_chunks,
+            task_type="RETRIEVAL_DOCUMENT"
+        )
+        all_embeddings = response['embedding']
+        logging.info("Embeddings generated.")
 
-    # 3. Process all questions in parallel for maximum speed
-    logging.info("Processing all questions concurrently...")
-    tasks = [process_single_question(q, text_chunks, chunk_embeddings) for q in payload.questions]
-    answers = await asyncio.gather(*tasks)
+        vectors_to_upsert = [
+            {"id": f"chunk_{i}", "values": embedding, "metadata": {"text": chunk}}
+            for i, (chunk, embedding) in enumerate(zip(text_chunks, all_embeddings))
+        ]
+        
+        logging.info(f"Upserting {len(vectors_to_upsert)} vectors to Pinecone...")
+        index.upsert(vectors=vectors_to_upsert, batch_size=100)
+        logging.info("Successfully upserted vectors.")
+
+        logging.info("Processing all questions concurrently...")
+        tasks = [process_single_question(q, index) for q in payload.questions]
+        answers = await asyncio.gather(*tasks)
 
     logging.info("Successfully processed all questions. Returning response.")
     return HackRxRunResponse(answers=answers)
