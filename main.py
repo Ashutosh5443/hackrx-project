@@ -63,10 +63,10 @@ def download_and_read_pdf(url: str) -> str:
         text = ""
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
             for page in doc:
-                text += page.get_text() + "\n"
+                text += page.get_text() + "\n\n" # Add double newline to preserve paragraph breaks
         
-        # Clean up the extracted text
-        text = re.sub(r'\s+', ' ', text).strip()
+        # Clean up residual noise
+        text = re.sub(r'\s*\n\s*', '\n', text).strip()
         logging.info(f"Extracted {len(text)} characters from the PDF.")
         return text
     except Exception as e:
@@ -74,9 +74,9 @@ def download_and_read_pdf(url: str) -> str:
         raise HTTPException(status_code=500, detail=f"Could not process PDF from URL: {e}")
 
 def get_text_chunks(text: str) -> List[str]:
-    """Splits text into paragraphs or large chunks."""
+    """Splits text into paragraphs or large chunks robustly."""
     chunks = [chunk.strip() for chunk in text.split('\n\n') if len(chunk.strip()) > 50]
-    if not chunks: # Fallback for documents without double newlines
+    if not chunks: # Fallback for documents without clear paragraph breaks
         chunks = [text[i:i+1000] for i in range(0, len(text), 800)]
     logging.info(f"Split text into {len(chunks)} chunks.")
     return chunks
